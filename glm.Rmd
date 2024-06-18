@@ -1,0 +1,240 @@
+```{r}
+options(repos = c(CRAN = "https://mirrors.ustc.edu.cn/CRAN/"))
+# install.packages("caret")
+# install.packages("bit64")
+# install.packages("VennDiagram")
+# install.packages("MASS")
+# install.packages("mgcv")
+# install.packages("lava")
+
+library(data.table)
+library(caret)
+library(bit64) #for the Device_ID
+library(VennDiagram)
+library(MASS)
+library(mgcv)
+textwidth<-7.3 #inch
+Sys.setlocale(category="LC_ALL",locale="Chinese-simplified")
+```
+
+# step1: 数据导入与预处理
+```{r}
+userlist<-fread("/Users/liliann/Desktop/2024spring/非寿险精算/Data/ubi_userlist.txt")
+policydata<-fread("/Users/liliann/Desktop/2024spring/非寿险精算/Data/ubi_policydata_mac.txt")#policydata<-read.table("Data/ubi_policydata.txt",sep=",",header=T,fileEncoding="GB18030")
+claimdata<-fread("/Users/liliann/Desktop/2024spring/非寿险精算/Data/ubi_claimdata_mac.txt")# claimdata<-read.table("Data/ubi_claimdata.txt",sep=",",header=T,fileEncoding="GB18030")
+
+lct <- Sys.getlocale("LC_TIME"); Sys.setlocale("LC_TIME", "C") #Solve NA issue in as.Date function
+policydata$UNDERWRITEENDDATE<-as.Date(policydata$UNDERWRITEENDDATE,format="%d%b%Y:%H:%M:%S")
+policydata$KINDSTARTDATE<-as.Date(policydata$KINDSTARTDATE,format="%d%b%Y:%H:%M:%S")
+policydata$DUEENDDATE<-as.Date(policydata$DUEENDDATE,format="%d%b%Y:%H:%M:%S")
+claimdata$DAMAGEDATE<-as.Date(claimdata$DAMAGEDATE,format="%d%b%Y:%H:%M:%S")
+claimdata$REPORTDATE<-as.Date(claimdata$REPORTDATE,format="%d%b%Y:%H:%M:%S")
+claimdata$ENDCASEDATE<-as.Date(claimdata$ENDCASEDATE,format="%d%b%Y:%H:%M:%S")
+# Policydata cleaning
+policydata<-data.frame(policydata,YEARS=rep(NA,nrow(policydata)),Device_ID=rep(userlist$PN[1],nrow(policydata))) #YEARS is the (expected) ultimate earned years; Device_ID is the ID of each vehicle
+
+i<-1
+while (i <= nrow(policydata)){
+  date_diff<-as.numeric(difftime(policydata$DUEENDDATE[i],policydata$KINDSTARTDATE[i]))+1
+  if (date_diff==366) {
+    policydata$YEARS[i]<-1
+  }
+  else {
+    policydata$YEARS[i]<-(as.numeric(difftime(policydata$DUEENDDATE[i],policydata$KINDSTARTDATE[i]))+1)/365
+  }
+  policydata$Device_ID[i]<-userlist$PN[userlist$policycode==policydata$policycode[i]]
+  i<-i+1
+}
+policydata<-policydata[-which(policydata$YEARS>2),] 
+policydata$AGE[policydata$AGE<18|policydata$AGE>100]<-NA 
+policydata<-policydata[-which(is.na(policydata$AGE)),] 
+policydata<-policydata[-which(policydata$PREMIUM==0),] 
+policydata<-policydata[policydata$YEARS>0,]
+
+#Claimdata cleaning
+claimdata<-data.frame(claimdata,Delay_report=rep(NA,nrow(claimdata)),Delay_pay=rep(NA,nrow(claimdata)),Device_ID=rep(userlist$PN[1],nrow(claimdata))) #Delay_report is the report delay in days; Delay_pay is the settlement delay in days.
+i <- 1
+while (i <= nrow(claimdata)){
+  claimdata$Delay_report[i]<-as.numeric(difftime(claimdata$REPORTDATE[i],claimdata$DAMAGEDATE[i],units="days"))
+  claimdata$Delay_pay[i]<-as.numeric(difftime(claimdata$ENDCASEDATE[i],claimdata$DAMAGEDATE[i],units="days"))
+  claimdata$Device_ID[i]<-userlist$PN[userlist$policycode==claimdata$policycode[i]]
+  i<-i+1
+}
+set_diff<-setdiff(unique(claimdata$policycode),unique(policydata$policycode))
+print(set_diff) #Two policies in claimdata have been removed from policydata in the data error cleaning procedure.
+claimdata<-claimdata[-which(claimdata$policycode%in%set_diff),]
+
+#Delay
+summary(claimdata$Delay_report[claimdata$KINDCODE=="车损险"])
+summary(claimdata$Delay_pay[claimdata$KINDCODE=="车损险"])
+summary(claimdata$Delay_report[claimdata$KINDCODE=="交强险"])
+summary(claimdata$Delay_pay[claimdata$KINDCODE=="交强险"])
+quantile(claimdata$Delay_report[claimdata$KINDCODE=="车损险"],0.95);quantile(claimdata$Delay_pay[claimdata$KINDCODE=="车损险"],0.95,na.rm=T)
+quantile(claimdata$Delay_report[claimdata$KINDCODE=="交强险"],0.95);quantile(claimdata$Delay_pay[claimdata$KINDCODE=="交强险"],0.95,na.rm=T)
+
+#Compile the frequency data
+freq_data<-data.frame(policydata,Counts=rep(0,nrow(policydata)))
+freq_ind<-rep(NA,nrow(claimdata))
+i <- 1
+while (i <= nrow(claimdata)){
+  kindcode<-claimdata$KINDCODE[i]
+  policycode_temp<-as.character(claimdata$policycode[i])
+  temp_ind<-which(freq_data$policycode==policycode_temp&freq_data$KINDCODE==kindcode)
+  if (length(temp_ind)==1){
+    freq_ind[i]<-temp_ind
+    freq_data$Counts[temp_ind]<-freq_data$Counts[temp_ind]+1
+  }
+  i<-i+1
+}
+summary(freq_ind)
+sum(freq_data$Counts)
+nrow(claimdata)
+
+STARTDATE<-as.Date("2014-01-01",format="%Y-%m-%d")
+ENDDATE<-as.Date("2017-05-31",format="%Y-%m-%d")
+freq_data<-freq_data[freq_data$KINDSTARTDATE>=STARTDATE&freq_data$KINDSTARTDATE<=ENDDATE,]
+dim(freq_data)
+
+i <- 1
+while (i <= nrow(freq_data)){
+  date_end<-as.Date(ifelse(freq_data$DUEENDDATE[i]>ENDDATE,ENDDATE,freq_data$DUEENDDATE[i]),format="%Y-%m-%d",origin = "1970-01-01")
+  freq_data$YEARS[i]<-ifelse(as.numeric(difftime(date_end,freq_data$KINDSTARTDATE[i]))+1==366,365,as.numeric(difftime(date_end,freq_data$KINDSTARTDATE[i]))+1)/365
+  i<-i+1
+}
+
+freq_data$SEX<-as.factor(freq_data$SEX)
+names(freq_data)
+data_ctp<-freq_data[freq_data$KINDCODE=="交强险",]
+names(data_ctp)
+dim(data_ctp)
+fwrite(freq_data[,c(2,3,11,12,13,20,21,22,23)],"./Data/freq_data.csv")
+fwrite(data_ctp[,c(11,12,21,22,23)],"./Data/data_ctp.csv")
+
+fileEncoding = "GB18030"
+```
+
+
+# step2: 数据分组
+```{r}
+#先向原数据表格中增加初值为空的年龄和车龄分组变量
+freq_data<-data.frame(freq_data,age_group=rep(NA,nrow(freq_data)),years_group=rep(NA,nrow(freq_data)))
+
+#遍历所有数据，将原数据的分组情况进行记录
+i <- 1
+while (i <= nrow(freq_data)){
+  #对年龄进行分组
+  if(freq_data$AGE[i]>=18 & freq_data$AGE[i]<=24) freq_data$age_group[i]<-"A"
+  else if(freq_data$AGE[i]>=25 & freq_data$AGE[i]<=34) freq_data$age_group[i]<-"B"
+  else if(freq_data$AGE[i]>=35 & freq_data$AGE[i]<=44) freq_data$age_group[i]<-"C"
+  else if(freq_data$AGE[i]>=45 & freq_data$AGE[i]<=54) freq_data$age_group[i]<-"D"
+  else if(freq_data$AGE[i]>=55 & freq_data$AGE[i]<=64) freq_data$age_group[i]<-"E"
+  else if(freq_data$AGE[i]>=65 & freq_data$AGE[i]<=100) freq_data$age_group[i]<-"F"
+
+  # #对车龄进行分组
+  if(freq_data$USEYEARS[i]>=0 & freq_data$USEYEARS[i]<=1) freq_data$years_group[i]<-"A"
+  else if(freq_data$USEYEARS[i]>=2 & freq_data$USEYEARS[i]<=4) freq_data$years_group[i]<-"B"
+  else if(freq_data$USEYEARS[i]>=5 & freq_data$USEYEARS[i]<=8) freq_data$years_group[i]<-"C"
+  else if(freq_data$USEYEARS[i]>=9 & freq_data$USEYEARS[i]<=14) freq_data$years_group[i]<-"D"
+  i<-i+1
+}
+
+#筛选“车损险”类型的数据
+data_bd<-freq_data[freq_data$KINDCODE=="车损险",]
+```
+
+# step3: 乘法模型建立
+## Q1: 模型及基本假设
+```{r}
+#offset表示平均索赔次数以风险单位数为权重
+data_bd_poisson<-glm(Counts~age_group+years_group,offset=log(YEARS),family=poisson(link="log"),data=data_bd)
+
+```
+
+## Q2: 计算参数的极大似然估计｜检验泊松分布离散系数
+```{r}
+#得到参数的极大似然估计
+summary(data_bd_poisson)
+
+#检验泊松分布离散系数
+##公式法：pearson统计量除以自由度
+sum(residuals.glm(data_bd_poisson,type="pearson")^2)/(nrow(data_bd)-length(data_bd_poisson$coefficients))
+##类泊松分布拟合（允许方差大于均值）输出离散系数
+summary(glm(Counts~age_group+years_group,offset=log(YEARS),family=quasipoisson(link="log"),data=data_bd))$dispersion
+```
+
+## Q3: 似然比检验-年龄组E和F索赔频率没有差异
+```{r}
+#将年龄组中E值替换为F并进行合并，取偏差之差，与0.05显著性水平下卡方统计量做比较
+data_bd_test1<-data_bd
+data_bd_test1$age_group[data_bd_test1$age_group=="E"]<-"F"
+deviance(glm(Counts~age_group+years_group,offset=log(YEARS),family=poisson(link="log"),data=data_bd_test1))-deviance(data_bd_poisson)
+qchisq(0.95,1)
+1-pchisq(5.069503,1)
+```
+
+## Q4: 似然比检验-车龄组A和B索赔频率没有差异
+```{r}
+#将车龄组中A值替换为B并进行合并，取偏差之差，与0.05显著性水平下卡方统计量做比较
+data_bd_test2<-data_bd
+data_bd_test2$years_group[data_bd_test2$years_group=="A"]<-"B"
+deviance(glm(Counts~age_group+years_group,offset=log(YEARS),family=poisson(link="log"),data=data_bd_test2))-deviance(data_bd_poisson)
+qchisq(0.95,1)
+1-pchisq(8.38504,1)
+```
+
+## Q5: 选取保单组并做预测
+```{r}
+#构造新的保单组：满足年龄分组为B，车龄分组为A，一年期
+selected_policy_group<-data.frame(age_group="B",years_group="A",YEARS=1)
+
+#预测索赔次数，link：poisson的连接函数
+link<-predict(data_bd_poisson,newdata=selected_policy_group,type="link",se.fit=T)
+
+#预测索赔次数，response：输出预测概率
+response<-predict(data_bd_poisson,newdata=selected_policy_group,type="response",se.fit=T)
+
+exp(link$fit)
+response$fit
+# 组中均方误差
+res_se<-response$se.fit
+res_fit<-response$fit
+
+res_se^2
+res_fit/100
+res_se^2+res_fit/100
+# 某保单均方误差
+res_se^2+res_fit
+```
+
+# step4: 分组累计得到新数据
+```{r}
+#已赚风险单位数累计
+earned<-aggregate(data_bd$YEARS,by=list(data_bd$age_group,data_bd$years_group),FUN=sum)
+#索赔次数累计
+counts<-aggregate(data_bd$Counts,by=list(data_bd$age_group,data_bd$years_group),FUN=sum)
+#建立新数据库
+data_new<-data.frame(age_group=earned$Group.1,years_group=earned$Group.2,YEARS=earned$x,Counts=counts$x)
+```
+
+# step5: 建立新索赔频率乘法模型
+```{r}
+data_new_poisson<-glm(Counts~age_group+years_group,offset=log(YEARS),family=poisson(link="log"),data=data_new)
+```
+
+## Q6: 两个索赔次数模型等价
+## Q7: 计算参数的极大似然估计｜检验泊松分布离散系数并与第二问做对比
+```{r}
+#极大似然估计系数
+summary(data_new_poisson)
+#检验离散系数
+summary(glm(Counts~age_group+years_group,offset=log(YEARS),family=quasipoisson(link="log"),data=data_new))$dispersion
+```
+
+## Q8: 考虑交互作用时的参数个数与极大似然估计
+```{r}
+#增加交互作用
+data_mut_poisson<-glm(Counts~age_group+years_group+age_group*years_group,offset=log(YEARS),family=poisson(link="log"),data=data_new)
+summary(data_mut_poisson)
+
+#print(exp(data_mut_poisson$coefficients))
+```
